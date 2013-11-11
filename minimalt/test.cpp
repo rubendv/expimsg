@@ -7,9 +7,9 @@
 #include <cstdint>
 #include "crypto.h"
 #include <map>
-#include <optional>
 #include <algorithm>
 #include <functional>
+#include <arpa/inet.h>
 
 _INITIALIZE_EASYLOGGINGPP
 
@@ -27,6 +27,7 @@ class PublicKey {
 public:
     std::string box_pk;
     std::string sign_pk;
+    PublicKey() {}
     PublicKey(const std::string& box_pk, const std::string& sign_pk="") 
     : box_pk(box_pk), sign_pk(sign_pk) {}
     bool has_sign_pk() {
@@ -38,14 +39,15 @@ class Certificate {
 public:
     std::string box_pk_signed;
     std::string sign_pk_signed;
-    const PublicKey& authority_pk;
-    PublicKey(const std::string& box_pk_signed, const std::string& sign_pk_signed, const PublicKey& authority_pk) 
+    PublicKey authority_pk;
+    Certificate() {}
+    Certificate(const std::string& box_pk_signed, const std::string& sign_pk_signed, const PublicKey& authority_pk) 
     : box_pk_signed(box_pk_signed), sign_pk_signed(sign_pk_signed), authority_pk(authority_pk) {}
     std::string box_pk() const {
-        return sign_open(box_signed, authority_pk.sign_pk);
+        return sign_open(box_pk_signed, authority_pk.sign_pk);
     }
     std::string sign_pk() const {
-        return sign_open(sign_signed, authority_pk.sign_pk);
+        return sign_open(sign_pk_signed, authority_pk.sign_pk);
     }
 };
 
@@ -54,13 +56,17 @@ public:
     std::string box_pk, box_sk, sign_pk, sign_sk;
     Key() {
         box_pk = box_keypair(box_sk);
-        sign_pk = sign_keypair(sign_pk);
+        sign_pk = sign_keypair(sign_sk);
     }
     PublicKey publicPart() {
         return PublicKey(box_pk, sign_pk);
     }
     Certificate certificate(const PublicKey& pk) {
-        return Certificate(sign(pk.box, sign_sk), sign(pk.sign, sign_sk), this->publicPart());
+        return Certificate(sign(pk.box_pk, sign_sk), sign(pk.sign_pk, sign_sk), this->publicPart());
+    }
+    ~Key() {
+        sodium_memzero(&box_sk[0], box_sk.size());
+        sodium_memzero(&sign_sk[0], sign_sk.size());
     }
 };
 
@@ -79,8 +85,66 @@ std::uint64_t ntohll(std::uint64_t value) {
     return htonll(value);
 }
 
+class Unboxed {
+public:
+    bool is_reliable;
+    std::uint32_t connection_id;
+    std::uint32_t sequence_number;
+    std::uint32_t acknowledgment;
+    std::string message;
 
-class Message {
+    Unboxed() {}
+
+    Unboxed(const std::string& boxed, const std::string& nonce, const std::string& key) {
+        std::uint64_t index = 0;
+        std::string unboxed = secretbox_open(boxed, nonce, key);
+        connection_id = ntohl(*reinterpret_cast<std::uint32_t *>(&unboxed[index]));
+        is_reliable = (connection_id & (1 << 31)) != 0;
+        connection_id &= ~(1 << 31);
+        index += 4;
+        if(is_reliable) {
+            sequence_number = ntohl(*reinterpret_cast<std::uint32_t *>(&unboxed[index]));
+            index += 4;
+            acknowledgment = ntohl(*reinterpret_cast<std::uint32_t *>(&unboxed[index]));
+            index += 4;
+        } 
+        message.resize(unboxed.size()-index, 0);
+        std::copy(
+            unboxed.begin()+index,
+            unboxed.end(),
+            message.begin()
+        );
+    }
+
+    std::string box(const std::string& nonce, const std::string& key) {
+        std::stringstream unboxed;
+        std::uint32_t packed_connection_id = htonl(((std::uint32_t)is_reliable << 31) | connection_id);
+        unboxed << std::string(reinterpret_cast<char *>(&packed_connection_id), sizeof(packed_connection_id));
+        if(is_reliable) {
+            std::uint32_t sequence_number_converted = htonl(sequence_number);
+            unboxed << std::string(reinterpret_cast<char *>(&sequence_number_converted), sizeof(sequence_number_converted));
+            std::uint32_t acknowledgment_converted = htonl(acknowledgment);
+            unboxed << std::string(reinterpret_cast<char *>(&acknowledgment_converted), sizeof(acknowledgment_converted));
+        }
+        unboxed << message;
+        return secretbox(unboxed.str(), nonce, key);
+    }
+    friend std::ostream& operator<< (std::ostream& stream, const Unboxed& unboxed);
+};
+
+std::ostream& operator<< (std::ostream& stream, const Unboxed& unboxed) {
+    stream << "Unboxed:" << std::endl;
+    stream << "connection_id: " << std::hex << unboxed.connection_id << std::endl;
+    if(unboxed.is_reliable) {
+        stream << "sequence_number: " << std::hex << unboxed.sequence_number << std::endl;
+        stream << "acknowledgment: " << std::hex << unboxed.acknowledgment << std::endl;
+    }
+    stream << "message: " << unboxed.message;
+    return stream;
+}
+
+
+class PublicMessage {
 public:
     bool ephemeral_pk_present;
     bool puzzle_or_solution_present:1;
@@ -96,9 +160,9 @@ public:
         std::uint64_t index = 0;
         std::uint64_t first8 = ntohll(*reinterpret_cast<std::uint64_t *>(&packet[index]));
         index += 8;
-        ephemeral_pk_present = (first8 & (1 << 63)) != 0;
-        puzzle_or_solution_present = (first8 & (1 << 62)) != 0;
-        tunnel_id = (first8 & (~(3 << 62)));
+        ephemeral_pk_present = (first8 & (1LL << 63)) != 0;
+        puzzle_or_solution_present = (first8 & (1LL << 62)) != 0;
+        tunnel_id = (first8 & (~(3LL << 62)));
         nonce.resize(crypto_box_NONCEBYTES, 0);
         std::copy(
             packet.begin()+index, 
@@ -135,10 +199,10 @@ public:
     std::string packetize() {
         std::stringstream packet;
         std::uint64_t first8 = ((std::uint64_t)ephemeral_pk_present << 63)
-                             | ((std::uint64_t)puzzle_or_solution_present << 63)
-                             | ((std::uint64_t)tunnel_id & (~(3 << 62)));
+                             | ((std::uint64_t)puzzle_or_solution_present << 62)
+                             | ((std::uint64_t)tunnel_id & (~(3LL << 62)));
         first8 = htonll(first8);
-        packet << reinterpret_cast<char *>(&first8);
+        packet << std::string(reinterpret_cast<char *>(&first8), 8);
         packet << nonce;
         if(ephemeral_pk_present) {
             packet << ephemeral_box_pk;
@@ -149,48 +213,70 @@ public:
         packet << boxed;
         return packet.str();
     }
+
+    Unboxed unbox(const Key& receiver_key) {
+        std::string secretbox_key = box_keyexchange(ephemeral_box_pk, receiver_key.box_sk);
+        return Unboxed(boxed, nonce, secretbox_key);
+    }
+    Unboxed unbox(const Key& receiver_key, const PublicKey& sender_pk) {
+        std::string secretbox_key = box_keyexchange(sender_pk.box_pk, receiver_key.box_sk);
+        return Unboxed(boxed, nonce, secretbox_key);
+    }
+
+    friend std::ostream& operator<< (std::ostream& stream, const PublicMessage& message);
+};
+
+std::ostream& operator<< (std::ostream& stream, const PublicMessage& message) {
+    stream << "PublicMessage:" << std::endl;
+    stream << "tunnel_id: " << std::hex << (message.tunnel_id & (~(3LL << 62))) << std::endl;
+    if(message.ephemeral_pk_present) {
+        stream << "ephemeral_pk: " << to_hex(message.ephemeral_box_pk) << std::endl;
+    }
+    if(message.puzzle_or_solution_present) {
+        stream << "puzzle_or_solution: " << to_hex(message.puzzle_or_solution) << std::endl;
+    }
+    stream << "nonce: " << to_hex(message.nonce);
+    return stream;
 }
 
-class Unboxed {
-public:
-    std::uint32_t connection_id;
-    bool is_reliable;
-    std::uint32_t sequence_number;
-    std::uint32_t acknowledgment;
-    std::string message;
 
-    Unboxed() {}
+PublicMessage makeRequestCertMessage(const std::string& identifier, const Key& sender_key, const PublicKey& receiver_pk) {
+    Unboxed unboxed;
+    unboxed.connection_id = 0;
+    unboxed.is_reliable = false;
+    std::stringstream innermessage;
+    innermessage << "requestCert:" << identifier; 
+    unboxed.message = innermessage.str();
 
-    Unboxed(const std::string& boxed, const std::string& nonce, const std::string& key, std::function<bool (std::uint32_t)> check_is_reliable) {
-        std::uint64_t index = 0;
-        std::string unboxed = secretbox_open(boxed, nonce, key);
-        connection_id = ntohl(reinterpret_cast<std::uint32_t *>(&boxed[index]));
-        index += 4;
-        is_reliable = check_is_reliable(connection_id);
-        if(is_reliable) {
-            sequence_number = ntohl(reinterpret_cast<std::uint32_t *>(&boxed[index]));
-            index += 4;
-            acknowledgment = ntohl(reinterpret_cast<std::uint32_t *>(&boxed[index]));
-            index += 4;
-        } 
-        message.resize(unboxed.size()-index, 0);
-        std::copy(
-            unboxed.begin()+index,
-            unboxed.end(),
-            message.begin()
-        );
-    }
+    PublicMessage message;
+    message.ephemeral_pk_present = true;
+    message.ephemeral_box_pk = sender_key.box_pk;
+    message.puzzle_or_solution_present = false;
+    randombytes_buf(reinterpret_cast<char *>(&message.tunnel_id), 8);
+    message.nonce = box_nonce_random();
+    std::string secretbox_key = box_keyexchange(receiver_pk.box_pk, sender_key.box_sk);
+    message.boxed = unboxed.box(message.nonce, secretbox_key); 
 
-    std::string box(const std::string& nonce, const std::string& key) {
-        std::stringstream unboxed;
-        unboxed << reinterpret_cast<char *>(&connection_id);
-        if(is_reliable) {
-            unboxed << reinterpret_cast<char *>(&sequence_number);
-            unboxed << reinterpret_cast<char *>(&acknowledgment);
-        }
-        unboxed << message;
-        return secretbox(boxed.str(), nonce, key);
-    }
+    return message;
+}
+
+PublicMessage makeProvideCertMessage(std::uint64_t tunnel_id, const Certificate& certificate, const Key& sender_key, const PublicKey& receiver_pk) {
+    Unboxed unboxed;
+    unboxed.connection_id = 0;
+    unboxed.is_reliable = false;
+    std::stringstream innermessage;
+    innermessage << "provideCert:box:" << to_hex(certificate.box_pk_signed) << ":sign:" << to_hex(certificate.sign_pk_signed);
+    unboxed.message = innermessage.str();
+
+    PublicMessage message;
+    message.ephemeral_pk_present = false;
+    message.puzzle_or_solution_present = false;
+    message.tunnel_id = tunnel_id;
+    message.nonce = box_nonce_random();
+    std::string secretbox_key = box_keyexchange(receiver_pk.box_pk, sender_key.box_sk);
+    message.boxed = unboxed.box(message.nonce, secretbox_key); 
+
+    return message;
 }
 
 int main(int argc, const char ** argv) {
@@ -199,57 +285,42 @@ int main(int argc, const char ** argv) {
     Key directory_long;
     Key directory_ephemeral;
     
-    std::map<std::string, PublicKey> directory_publickeys;
+    std::map<std::string, Certificate> directory_certificates;
     
     Key rubendvbe_long;
     Key rubendvbe_ephemeral;
-    directory_server_certificates["rubendv.be:80"] = directory_long.certificate(rubendvbe_ephemeral.publicPart());
+    directory_certificates.insert(std::make_pair<std::string, Certificate>("directory", directory_long.certificate(directory_ephemeral.publicPart())));
+    directory_certificates.insert(std::make_pair<std::string, Certificate>("rubendv.be:80", directory_long.certificate(rubendvbe_ephemeral.publicPart())));
 
     Key client_long;
     Key client_ephemeral;
     PublicKey directory_long_public = directory_long.publicPart();
-
-    std::string pk_sender, sk_sender;
-    std::string pk_receiver, sk_receiver;
     
-    pk_sender = box_keypair(sk_sender);
-    pk_receiver = box_keypair(sk_receiver);
+    std::string identifier = "directory";
+    PublicMessage requestCertMessage = makeRequestCertMessage(identifier, client_ephemeral, directory_long_public);
+    PublicMessage requestCertMessageReceived(requestCertMessage.packetize());
 
-    LOG(INFO) << std::setw(30) << "Public key sender: " << to_hex(pk_sender);
-    LOG(INFO) << std::setw(30) << "Secret key sender: " << to_hex(sk_sender);
-    LOG(INFO) << std::setw(30) << "Public key receiver: " << to_hex(pk_receiver);
-    LOG(INFO) << std::setw(30) << "Secret key receiver: " << to_hex(sk_receiver);
+    LOG(INFO) << requestCertMessage;
+    LOG(INFO) << requestCertMessageReceived;
+    Unboxed requestCertMessageReceivedUnboxed = requestCertMessageReceived.unbox(directory_long);
+    LOG(INFO) << requestCertMessageReceivedUnboxed;
+
+    PublicKey client_pk(requestCertMessageReceived.ephemeral_box_pk);
+
+    PublicMessage provideCertMessage = makeProvideCertMessage(
+        requestCertMessageReceived.tunnel_id, 
+        directory_certificates[requestCertMessageReceivedUnboxed.message.substr(std::string("requestCert:").size())],
+        directory_long,
+        client_pk
+    );
+    std::string provideCertPacket = provideCertMessage.packetize();
+    LOG(INFO) << "provideCertPacket: " << std::dec << provideCertPacket.size() << " bytes";
+    PublicMessage provideCertMessageReceived = PublicMessage(provideCertPacket);
     
-    std::string message = "Hello, world!";
-    LOG(INFO) << std::setw(30) << "Message: " << to_hex(message);
-    std::string nonce = box_nonce_random();
-    LOG(INFO) << std::setw(30) << "Nonce: " << to_hex(nonce);
-    std::string key_sender = box_keyexchange(pk_receiver, sk_sender);
-    LOG(INFO) << std::setw(30) << "Shared key sender: " << to_hex(key_sender);
-    std::string key_receiver = box_keyexchange(pk_sender, sk_receiver);
-    LOG(INFO) << std::setw(30) << "Shared key receiver: " << to_hex(key_receiver);
-    std::string ciphertext = secretbox(message, nonce, key_sender);
-    LOG(INFO) << std::setw(30) << "Ciphertext: " << to_hex(ciphertext);
-    try {
-        std::string message_decrypted = secretbox_open(ciphertext, nonce, key_receiver);
-        LOG(INFO) << std::setw(30) << "Message (decrypted): " << to_hex(message_decrypted);
-    } catch(box_error& e) {
-        LOG(ERROR) << "Failed to decrypt message";
-    }
-
-    std::string pk_sign, sk_sign;
-    pk_sign = sign_keypair(sk_sign);
-    LOG(INFO) << std::setw(30) << "Public signing key: " << to_hex(pk_sign);
-    LOG(INFO) << std::setw(30) << "Secret signing key: " << to_hex(sk_sign);
-
-    std::string signed_message = sign(message, sk_sign);
-    LOG(INFO) << std::setw(30) << "Signed message: " << to_hex(signed_message);
-    try {
-        std::string verified_message = sign_open(signed_message, pk_sign);
-        LOG(INFO) << std::setw(30) << "Message (verified): " << to_hex(verified_message);
-    } catch(sign_error& e) {
-        LOG(ERROR) << "Failed to verify message";
-    }
+    LOG(INFO) << provideCertMessage;
+    LOG(INFO) << provideCertMessageReceived;
+    Unboxed provideCertMessageReceivedUnboxed = provideCertMessageReceived.unbox(client_ephemeral, directory_long_public);
+    LOG(INFO) << provideCertMessageReceivedUnboxed;
 
     return 0;
 }
