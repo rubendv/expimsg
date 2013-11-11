@@ -25,4 +25,5 @@ std::string secretbox_open(std::string ciphertext, std::string nonce, std::strin
 std::string sign_keypair(std::string& sk);
 std::string sign(std::string m, std::string sk);
 std::string sign_open(std::string sm, std::string pk);
+
 #endif
